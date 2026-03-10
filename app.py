@@ -198,6 +198,56 @@ def resample_ohlcv(df, rule):
     ).dropna().reset_index()
     return r
 
+def compute_choch_signals(df, n=5):
+    """
+    CHoCH（チェンジオブキャラクター）を全バーに対して事前計算。
+    
+    スイング高値/安値の定義：
+      前後n本の中で最も高い/低い値を持つバー
+    
+    CHoCH定義：
+      bull_choch[i] = 直前スイング高値をclose確定で上抜けた瞬間
+      bear_choch[i] = 直前スイング安値をclose確定で下抜けた瞬間
+    
+    FVG/Zoneプルバックとの共存を可能にするため
+    「現在バーで発生」ではなく「過去N本以内で発生」として
+    check_trend_entry等で参照する。
+    """
+    length   = len(df)
+    highs    = df['high'].values
+    lows     = df['low'].values
+    closes   = df['close'].values
+
+    swing_high_vals = np.full(length, np.nan)
+    swing_low_vals  = np.full(length, np.nan)
+
+    # スイング高値/安値を検出（center=True方式、先端はnm本分はNaN）
+    for i in range(n, length - n):
+        if highs[i] == highs[i-n:i+n+1].max():
+            swing_high_vals[i] = highs[i]
+        if lows[i] == lows[i-n:i+n+1].min():
+            swing_low_vals[i] = lows[i]
+
+    # 直近スイング値を前方伝播し、CHoCH判定
+    bull_choch = np.zeros(length, dtype=bool)
+    bear_choch = np.zeros(length, dtype=bool)
+    last_sh = np.nan
+    last_sl = np.nan
+
+    for i in range(1, length):
+        # 前バーまでの最新スイング値を更新（look-ahead防止）
+        if not np.isnan(swing_high_vals[i-1]):
+            last_sh = swing_high_vals[i-1]
+        if not np.isnan(swing_low_vals[i-1]):
+            last_sl = swing_low_vals[i-1]
+
+        if not np.isnan(last_sh) and closes[i] > last_sh and closes[i-1] <= last_sh:
+            bull_choch[i] = True
+        if not np.isnan(last_sl) and closes[i] < last_sl and closes[i-1] >= last_sl:
+            bear_choch[i] = True
+
+    return bull_choch, bear_choch
+
 def build_indicators(df5m):
     df15m = resample_ohlcv(df5m, '15min')
     df1h  = resample_ohlcv(df5m, '1h')
@@ -210,6 +260,10 @@ def build_indicators(df5m):
         df['ema21']      = df['close'].ewm(span=21, adjust=False).mean().values
         df['rsi']        = calc_rsi(df['close']).values
         df['atr_ma20']   = df['atr'].rolling(20).mean()
+    # 5M足にCHoCH信号を事前計算（FVG/Zoneとのシーケンス判定に使用）
+    bull_choch, bear_choch = compute_choch_signals(df5m, n=5)
+    df5m['bull_choch'] = bull_choch
+    df5m['bear_choch'] = bear_choch
     return df5m, df15m, df1h
 
 # ──────────────────────────────────────────────────────────
@@ -244,22 +298,23 @@ def detect_zone(df, i, direction, p):
 
 def detect_choch(df, i, direction, p):
     """
-    CHoCH：直近N本の高値/安値ブレイクで判定。
-    FVG/Zone内にいる状態でも成立するよう
-    lookbackを短く（2〜3本）して直近構造のブレイクを見る。
+    CHoCH（シーケンス判定）：
+    過去choch_window本以内にスイング高値/安値のcloseブレイクが
+    発生していたかを確認する。
+
+    FVG/Zoneへのプルバックと共存できる理由：
+      CHoCHは数本前に発生 → 現在価格はFVG/Zoneにプルバック済み
+      = 同時成立ではなくシーケンスとして判定
     """
-    lb = 3  # 直近3本の構造ブレイク
-    if i < lb + 1:
-        return False
-    # 直近lb本（現在バーを除く）の高値/安値
-    recent = df.iloc[i - lb: i]
+    choch_window = 15
+    start = max(0, i - choch_window)
     if direction == 'buy':
-        # 直近安値圏から反転して直近高値を上抜け
-        return float(df['close'].iloc[i]) > float(recent['high'].max())
+        return bool(df['bull_choch'].iloc[start:i+1].any())
     else:
-        return float(df['close'].iloc[i]) < float(recent['low'].min())
+        return bool(df['bear_choch'].iloc[start:i+1].any())
 
 def detect_sweep(df, i, direction, p):
+    """現在バーで流動性スイープが発生しているか"""
     if i < 10:
         return False
     lb = p['swing_lookback']
@@ -272,6 +327,16 @@ def detect_sweep(df, i, direction, p):
     else:
         ph = prev['high'].max()
         return float(cur['high']) > ph and float(cur['close']) < ph and (float(cur['high']) - ph) > atr * 0.2
+
+def detect_sweep_recent(df, i, direction, p, lookback=8):
+    """
+    REVERSAL用：過去lookback本以内にスイープが発生していたか。
+    スイープ後CHoCH確認 -> FVG/Zoneでエントリーのシーケンスに対応。
+    """
+    for k in range(max(0, i - lookback), i + 1):
+        if detect_sweep(df, k, direction, p):
+            return True
+    return False
 
 def detect_rsi_div(df, i, direction):
     lb = 20
@@ -326,8 +391,9 @@ def get_15m_regime(df15m, ts, h1, p):
     if adx >= p['adx_trend_min'] and adx_drop:
         h1_dir = h1.get('direction')
         rev_dir = 'sell' if h1_dir == 'buy' else 'buy'
-        if detect_rsi_div(bars, i, rev_dir):
-            return {'regime': 'REVERSAL', 'direction': rev_dir, 'adx': adx}
+        # RSIダイバージェンスはレジーム判定ゲートから除外
+        # → スコアリングに移管（ここで要求するとREVERSAL件数ゼロになる）
+        return {'regime': 'REVERSAL', 'direction': rev_dir, 'adx': adx}
 
     is_range, rh, rl = detect_range(bars, i, p)
     atr_expand = atr > atr_ma * p['atr_breakout_mult']
@@ -441,11 +507,19 @@ def check_trend_entry(df5m, i, direction, regime, h1, p):
     return {'sl_price': sl, 'score': score}
 
 def check_reversal_entry(df5m, i, direction, regime, h1, p):
+    """
+    REVERSAL エントリー条件（シーケンス判定）:
+      1. 過去8本以内にスイープ発生
+      2. 過去15本以内にCHoCH確認（スイープ後の構造転換）
+      3. スコア閾値通過
+    スイープとCHoCHを同時要求しないことでREVERSAL件数ゼロを解消。
+    """
     if not h1.get('trend_valid'): return None
-    if not detect_sweep(df5m, i, direction, p): return None
+    # スイープ：過去8本以内（現在バー含む）
+    if not detect_sweep_recent(df5m, i, direction, p, lookback=8): return None
+    # CHoCH：過去15本以内（スイープ後の転換確認）
     if not detect_choch(df5m, i, direction, p): return None
-    # RSIダイバージェンスはゲートから外してスコアリングのみで判定
-    # （15MとのAND条件が極端に厳しいため件数ゼロになる）
+    # RSIダイバージェンスはスコアリングのみ（ゲートから除外済み）
     score = score_reversal(df5m, i, direction, regime, h1, p)
     if score < p['approve_threshold']: return None
     atr = float(df5m['atr'].iloc[i])
