@@ -243,14 +243,21 @@ def detect_zone(df, i, direction, p):
         return float(window['high'].max())
 
 def detect_choch(df, i, direction, p):
-    lookback = p['choch_lookback']
-    if i < lookback * 2:
+    """
+    CHoCH：直近N本の高値/安値ブレイクで判定。
+    FVG/Zone内にいる状態でも成立するよう
+    lookbackを短く（2〜3本）して直近構造のブレイクを見る。
+    """
+    lb = 3  # 直近3本の構造ブレイク
+    if i < lb + 1:
         return False
-    window = df.iloc[max(0, i-lookback*2):i+1]
+    # 直近lb本（現在バーを除く）の高値/安値
+    recent = df.iloc[i - lb: i]
     if direction == 'buy':
-        return float(df['close'].iloc[i]) > float(window['high'].iloc[:-1].max())
+        # 直近安値圏から反転して直近高値を上抜け
+        return float(df['close'].iloc[i]) > float(recent['high'].max())
     else:
-        return float(df['close'].iloc[i]) < float(window['low'].iloc[:-1].min())
+        return float(df['close'].iloc[i]) < float(recent['low'].min())
 
 def detect_sweep(df, i, direction, p):
     if i < 10:
@@ -437,7 +444,8 @@ def check_reversal_entry(df5m, i, direction, regime, h1, p):
     if not h1.get('trend_valid'): return None
     if not detect_sweep(df5m, i, direction, p): return None
     if not detect_choch(df5m, i, direction, p): return None
-    if not detect_rsi_div(df5m, i, direction): return None
+    # RSIダイバージェンスはゲートから外してスコアリングのみで判定
+    # （15MとのAND条件が極端に厳しいため件数ゼロになる）
     score = score_reversal(df5m, i, direction, regime, h1, p)
     if score < p['approve_threshold']: return None
     atr = float(df5m['atr'].iloc[i])
@@ -540,14 +548,16 @@ def simulate_trade(trade, df5m, entry_idx, p):
 def run_backtest(df5m_raw, p, progress_bar=None):
     df5m, df15m, df1h = build_indicators(df5m_raw.copy())
     trades, balance, curve = [], p['initial_balance'], [p['initial_balance']]
-    in_trade, pending_bo   = False, None
+    pending_bo   = None
     cost = p['spread_dollar'] + p['slippage_dollar']
     total_bars = len(df5m)
+    exit_bar = -1  # BUG #3修正: トレード終了バーを追跡
 
     for i in range(50, total_bars - 1):
         if progress_bar and i % 500 == 0:
             progress_bar.progress(i / total_bars)
-        if in_trade:
+        # BUG #3修正: exit_barまでスキップ（ポジション保有中）
+        if i <= exit_bar:
             continue
 
         ts    = df5m['timestamp'].iloc[i]
@@ -617,6 +627,8 @@ def run_backtest(df5m_raw, p, progress_bar=None):
             'pnl': 0.0, 'partial_pnl': 0.0, 'outcome': '', 'duration_bars': 0, 'be_applied': False
         }
         trade = simulate_trade(trade, df5m, i, p)
+        # BUG #3修正: このトレードが終了するバーを記録
+        exit_bar = i + trade['duration_bars']
         net   = trade['pnl'] + trade['partial_pnl']
         balance += net
         curve.append(balance)
